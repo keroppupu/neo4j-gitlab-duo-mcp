@@ -4,12 +4,13 @@ Enterprise Multi-Project C / COBOL / Pro*C / Pro*COBOL Dependency & Database Gra
 
 Supports:
 - Multi-project isolation & cross-project relationships via (:Project) nodes and project property tagging.
-- C / C++ (.c, .h, .cpp, .hpp)
+- C / C++ (.c, .h, .cpp, .hpp) with C/C++ comment stripping.
 - Pro*C (.pc, .pcc) - Embedded SQL
 - COBOL (.cbl, .cob, .cobol)
 - Pro*COBOL (.pco, .pbl) - Embedded SQL in COBOL
 - Copybook (.cpy) - Data Division structure & fields parser
-- LAN server sync via --neo4j-url http://<SERVER_IP>:7474 --sync
+- Cypher string escaping to prevent query syntax injection/errors.
+- Batch HTTP transaction chunks to handle large repositories safely.
 """
 
 import os
@@ -20,6 +21,30 @@ import argparse
 import urllib.request
 import urllib.error
 from pathlib import Path
+
+
+def escape_cypher_str(val: str) -> str:
+    """Escapes backslashes and single quotes for safe Cypher string literals."""
+    if not isinstance(val, str):
+        val = str(val)
+    return val.replace('\\', '\\\\').replace("'", "\\'")
+
+
+def strip_c_comments(text: str) -> str:
+    """Removes C (/* */) and C++ (//) comments while preserving string literals and line count."""
+    def replacer(match):
+        s = match.group(0)
+        if s.startswith('/'):
+            # Replace comment with whitespace preserving newlines
+            return re.sub(r'[^\n]', ' ', s)
+        else:
+            return s
+
+    pattern = re.compile(
+        r'//.*?$|/\*.*?\*/|\'(?:\\.|[^\\\'])*\'|"(?:\\.|[^\\"])*"',
+        re.DOTALL | re.MULTILINE
+    )
+    return re.sub(pattern, replacer, text)
 
 
 class SqlExtractor:
@@ -82,8 +107,9 @@ class CAndProCParser:
         re.MULTILINE | re.DOTALL
     )
     FUNC_CALL_REGEX = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
+    KEYWORDS = {'if', 'for', 'while', 'switch', 'return', 'sizeof'}
 
-    def parse(self, file_path: str, rel_path: str, content: str, is_proc: bool = False):
+    def parse(self, file_path: str, rel_path: str, raw_content: str, is_proc: bool = False):
         file_name = os.path.basename(file_path)
         data = {
             "type": "Pro*C" if is_proc else "C",
@@ -96,32 +122,39 @@ class CAndProCParser:
             "sql_operations": []
         }
 
-        for m in self.INCLUDE_REGEX.finditer(content):
+        # 1. Embedded SQL should be extracted before stripping comments (or after, SQL supports comments too)
+        if is_proc or "EXEC SQL" in raw_content.upper():
+            data["sql_operations"] = SqlExtractor.extract_sql_from_c(raw_content)
+
+        # 2. Strip C/C++ comments so commented out functions/calls are not falsely parsed
+        clean_content = strip_c_comments(raw_content)
+
+        # 3. Includes
+        for m in self.INCLUDE_REGEX.finditer(clean_content):
             data["includes"].append({
                 "target": m.group(2),
                 "is_system": m.group(1) == '<'
             })
 
-        for m in self.MACRO_REGEX.finditer(content):
+        # 4. Macros
+        for m in self.MACRO_REGEX.finditer(clean_content):
             data["macros"].append(m.group(1))
 
-        matches = list(self.FUNC_DEF_REGEX.finditer(content))
+        # 5. Functions & calls
+        matches = list(self.FUNC_DEF_REGEX.finditer(clean_content))
         for i, match in enumerate(matches):
             func_name = match.group(1)
-            if func_name in {'if', 'for', 'while', 'switch'}:
+            if func_name in self.KEYWORDS:
                 continue
             data["functions"].append(func_name)
 
             start_pos = match.end()
-            end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(content)
-            body = content[start_pos:end_pos]
+            end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(clean_content)
+            body = clean_content[start_pos:end_pos]
 
             for call in set(self.FUNC_CALL_REGEX.findall(body)):
-                if call not in {'if', 'for', 'while', 'switch'} and call != func_name:
+                if call not in self.KEYWORDS and call != func_name:
                     data["calls"].append({"caller": func_name, "callee": call})
-
-        if is_proc or "EXEC SQL" in content.upper():
-            data["sql_operations"] = SqlExtractor.extract_sql_from_c(content)
 
         return data
 
@@ -144,7 +177,11 @@ class CopybookParser:
         for line in content.splitlines():
             if re.match(r'^\d{6}', line):
                 line = line[6:]
-            if line.startswith('*') or line.startswith('/'):
+            # Check comment in column 7 or general leading comment
+            stripped = line.strip()
+            if stripped.startswith('*') or stripped.startswith('/'):
+                continue
+            if len(line) >= 7 and line[6] in ('*', '/'):
                 continue
             
             m = self.FIELD_REGEX.search(line)
@@ -191,7 +228,10 @@ class CobolAndProCobolParser:
         for line in content.splitlines():
             if re.match(r'^\d{6}', line):
                 line = line[6:]
-            if line.startswith('*') or line.startswith('/'):
+            stripped = line.strip()
+            if stripped.startswith('*') or stripped.startswith('/'):
+                continue
+            if len(line) >= 7 and line[6] in ('*', '/'):
                 continue
             cleaned_lines.append(line)
         cleaned = "\n".join(cleaned_lines)
@@ -259,163 +299,177 @@ def scan_repository(repo_root):
 
 
 def build_graph_statements(results, project_name="default"):
-    """
-    Builds graph statements with multi-project scoping.
-    Every artifact connects to a (:Project {name: $project_name}) node and has project property.
-    Database tables can be shared across projects to detect cross-project data dependencies.
-    """
     statements = []
+    p_name = escape_cypher_str(project_name)
 
     # Project Node
-    statements.append(f"""
-    MERGE (proj:Project {{name: '{project_name}'}})
-    """)
+    statements.append(f"""MERGE (proj:Project {{name: '{p_name}'}})""")
 
     for item in results:
-        f_name = item["file"]
-        f_path = item["path"]
-        f_type = item["type"]
+        f_name = escape_cypher_str(item["file"])
+        f_path = escape_cypher_str(item["path"])
+        f_type = escape_cypher_str(item["type"])
 
         # Base File Node linked to Project
         statements.append(f"""
-        MERGE (proj:Project {{name: '{project_name}'}})
-        MERGE (f:SourceFile {{path: '{f_path}', project: '{project_name}'}})
+        MERGE (proj:Project {{name: '{p_name}'}})
+        MERGE (f:SourceFile {{path: '{f_path}', project: '{p_name}'}})
         SET f.name = '{f_name}', f.type = '{f_type}'
         MERGE (proj)-[:CONTAINS_FILE]->(f)
         """)
 
         # 1. Copybook
-        if f_type == "COPYBOOK":
-            cb_name = item["copybook_name"]
+        if item["type"] == "COPYBOOK":
+            cb_name = escape_cypher_str(item["copybook_name"])
             statements.append(f"""
-            MERGE (f:SourceFile {{path: '{f_path}', project: '{project_name}'}})
-            MERGE (cb:Copybook {{name: '{cb_name}', project: '{project_name}'}})
+            MERGE (f:SourceFile {{path: '{f_path}', project: '{p_name}'}})
+            MERGE (cb:Copybook {{name: '{cb_name}', project: '{p_name}'}})
             SET cb.file = '{f_path}'
             MERGE (f)-[:CONTAINS]->(cb)
             """)
 
             for field in item["fields"]:
-                f_level = field["level"]
-                fld_name = field["name"]
-                f_pic = field["pic"]
+                f_level = escape_cypher_str(field["level"])
+                fld_name = escape_cypher_str(field["name"])
+                f_pic = escape_cypher_str(field["pic"])
                 statements.append(f"""
-                MERGE (cb:Copybook {{name: '{cb_name}', project: '{project_name}'}})
-                MERGE (cf:CopybookField {{name: '{fld_name}', copybook: '{cb_name}', project: '{project_name}'}})
+                MERGE (cb:Copybook {{name: '{cb_name}', project: '{p_name}'}})
+                MERGE (cf:CopybookField {{name: '{fld_name}', copybook: '{cb_name}', project: '{p_name}'}})
                 SET cf.level = '{f_level}', cf.pic = '{f_pic}'
                 MERGE (cb)-[:DEFINES_FIELD]->(cf)
                 """)
 
         # 2. C / Pro*C
-        elif f_type in ("C", "Pro*C"):
+        elif item["type"] in ("C", "Pro*C"):
             for inc in item["includes"]:
+                inc_target = escape_cypher_str(inc["target"])
+                is_sys = "true" if inc["is_system"] else "false"
                 statements.append(f"""
-                MERGE (f:SourceFile {{path: '{f_path}', project: '{project_name}'}})
-                MERGE (inc:HeaderFile {{name: '{inc["target"]}', project: '{project_name}'}})
-                SET inc.is_system = {str(inc["is_system"]).lower()}
+                MERGE (f:SourceFile {{path: '{f_path}', project: '{p_name}'}})
+                MERGE (inc:HeaderFile {{name: '{inc_target}', project: '{p_name}'}})
+                SET inc.is_system = {is_sys}
                 MERGE (f)-[:INCLUDES]->(inc)
                 """)
 
             for fn in item["functions"]:
+                fn_name = escape_cypher_str(fn)
                 statements.append(f"""
-                MERGE (f:SourceFile {{path: '{f_path}', project: '{project_name}'}})
-                MERGE (fn:Function {{name: '{fn}', project: '{project_name}', file: '{f_path}'}})
+                MERGE (f:SourceFile {{path: '{f_path}', project: '{p_name}'}})
+                MERGE (fn:Function {{name: '{fn_name}', project: '{p_name}', file: '{f_path}'}})
                 MERGE (f)-[:DEFINES]->(fn)
                 """)
 
             for call in item["calls"]:
+                caller = escape_cypher_str(call["caller"])
+                callee = escape_cypher_str(call["callee"])
                 statements.append(f"""
-                MERGE (caller:Function {{name: '{call["caller"]}', project: '{project_name}', file: '{f_path}'}})
-                MERGE (callee:Function {{name: '{call["callee"]}', project: '{project_name}'}})
+                MERGE (caller:Function {{name: '{caller}', project: '{p_name}', file: '{f_path}'}})
+                MERGE (callee:Function {{name: '{callee}', project: '{p_name}'}})
                 MERGE (caller)-[:CALLS]->(callee)
                 """)
 
-            # Database Table access (DatabaseTable node is globally identified by name across projects)
             for sql in item.get("sql_operations", []):
-                action = sql["action"]
+                action = escape_cypher_str(sql["action"])
                 for tbl in sql["tables"]:
+                    tbl_name = escape_cypher_str(tbl)
                     statements.append(f"""
-                    MERGE (f:SourceFile {{path: '{f_path}', project: '{project_name}'}})
-                    MERGE (t:DatabaseTable {{name: '{tbl}'}})
-                    MERGE (f)-[:ACCESSES_TABLE {{action: '{action}', project: '{project_name}'}}]->(t)
+                    MERGE (f:SourceFile {{path: '{f_path}', project: '{p_name}'}})
+                    MERGE (t:DatabaseTable {{name: '{tbl_name}'}})
+                    MERGE (f)-[:ACCESSES_TABLE {{action: '{action}', project: '{p_name}'}}]->(t)
                     """)
 
         # 3. COBOL / Pro*COBOL
-        elif f_type in ("COBOL", "Pro*COBOL"):
-            prog = item["program_id"]
+        elif item["type"] in ("COBOL", "Pro*COBOL"):
+            prog = escape_cypher_str(item["program_id"])
+            is_procobol = "true" if item["type"] == "Pro*COBOL" else "false"
             statements.append(f"""
-            MERGE (f:SourceFile {{path: '{f_path}', project: '{project_name}'}})
-            MERGE (p:CobolProgram {{name: '{prog}', project: '{project_name}'}})
-            SET p.file = '{f_path}', p.is_procobol = {str(f_type == "Pro*COBOL").lower()}
+            MERGE (f:SourceFile {{path: '{f_path}', project: '{p_name}'}})
+            MERGE (p:CobolProgram {{name: '{prog}', project: '{p_name}'}})
+            SET p.file = '{f_path}', p.is_procobol = {is_procobol}
             MERGE (f)-[:CONTAINS]->(p)
             """)
 
             for cpy in item["copybooks"]:
+                cpy_name = escape_cypher_str(cpy.upper())
                 statements.append(f"""
-                MERGE (p:CobolProgram {{name: '{prog}', project: '{project_name}'}})
-                MERGE (cb:Copybook {{name: '{cpy.upper()}', project: '{project_name}'}})
+                MERGE (p:CobolProgram {{name: '{prog}', project: '{p_name}'}})
+                MERGE (cb:Copybook {{name: '{cpy_name}', project: '{p_name}'}})
                 MERGE (p)-[:COPIES]->(cb)
                 """)
 
             for ext_call in item["calls"]:
+                sub_name = escape_cypher_str(ext_call.upper())
                 statements.append(f"""
-                MERGE (p:CobolProgram {{name: '{prog}', project: '{project_name}'}})
-                MERGE (sub:CobolProgram {{name: '{ext_call.upper()}', project: '{project_name}'}})
+                MERGE (p:CobolProgram {{name: '{prog}', project: '{p_name}'}})
+                MERGE (sub:CobolProgram {{name: '{sub_name}', project: '{p_name}'}})
                 MERGE (p)-[:CALLS]->(sub)
                 """)
 
             for sec in item["sections"]:
+                sec_name = escape_cypher_str(sec)
                 statements.append(f"""
-                MERGE (p:CobolProgram {{name: '{prog}', project: '{project_name}'}})
-                MERGE (s:Section {{name: '{sec}', program: '{prog}', project: '{project_name}'}})
+                MERGE (p:CobolProgram {{name: '{prog}', project: '{p_name}'}})
+                MERGE (s:Section {{name: '{sec_name}', program: '{prog}', project: '{p_name}'}})
                 MERGE (p)-[:DEFINES_SECTION]->(s)
                 """)
 
             for perf in item["performs"]:
+                perf_name = escape_cypher_str(perf)
                 statements.append(f"""
-                MERGE (p:CobolProgram {{name: '{prog}', project: '{project_name}'}})
-                MERGE (s:Section {{name: '{perf}', program: '{prog}', project: '{project_name}'}})
+                MERGE (p:CobolProgram {{name: '{prog}', project: '{p_name}'}})
+                MERGE (s:Section {{name: '{perf_name}', program: '{prog}', project: '{p_name}'}})
                 MERGE (p)-[:PERFORMS]->(s)
                 """)
 
             for sql in item.get("sql_operations", []):
-                action = sql["action"]
+                action = escape_cypher_str(sql["action"])
                 for tbl in sql["tables"]:
+                    tbl_name = escape_cypher_str(tbl)
                     statements.append(f"""
-                    MERGE (p:CobolProgram {{name: '{prog}', project: '{project_name}'}})
-                    MERGE (t:DatabaseTable {{name: '{tbl}'}})
-                    MERGE (p)-[:ACCESSES_TABLE {{action: '{action}', project: '{project_name}'}}]->(t)
+                    MERGE (p:CobolProgram {{name: '{prog}', project: '{p_name}'}})
+                    MERGE (t:DatabaseTable {{name: '{tbl_name}'}})
+                    MERGE (p)-[:ACCESSES_TABLE {{action: '{action}', project: '{p_name}'}}]->(t)
                     """)
 
     return statements
 
 
-def execute_cypher_via_http(statements, neo4j_url="http://localhost:7474", auth=("neo4j", "password123")):
+def execute_cypher_via_http(statements, neo4j_url="http://localhost:7474", auth=("neo4j", "password123"), chunk_size=50):
+    """Executes Cypher statements in safe chunks to avoid payload timeouts/failures."""
     endpoint = f"{neo4j_url.rstrip('/')}/db/neo4j/tx/commit"
-    tx_statements = [{"statement": stmt.strip()} for stmt in statements if stmt.strip()]
-    if not tx_statements:
+    raw_statements = [s.strip() for s in statements if s.strip()]
+    if not raw_statements:
         print("[!] No statements to execute.")
         return True
 
-    payload = json.dumps({"statements": tx_statements}).encode("utf-8")
-    req = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json"})
-    
     import base64
     auth_str = f"{auth[0]}:{auth[1]}"
     b64_auth = base64.b64encode(auth_str.encode("utf-8")).decode("ascii")
-    req.add_header("Authorization", f"Basic {b64_auth}")
 
-    try:
-        with urllib.request.urlopen(req) as resp:
-            resp_data = json.loads(resp.read().decode("utf-8"))
-            errors = resp_data.get("errors", [])
-            if errors:
-                print(f"[!] Neo4j Error: {errors}")
-                return False
-            print(f"[+] Successfully executed {len(tx_statements)} graph statements in Neo4j.")
-            return True
-    except urllib.error.URLError as e:
-        print(f"[-] Could not connect to Neo4j HTTP API at {endpoint}: {e}")
-        return False
+    total = len(raw_statements)
+    executed = 0
+
+    for i in range(0, total, chunk_size):
+        chunk = raw_statements[i:i + chunk_size]
+        payload = json.dumps({"statements": [{"statement": stmt} for stmt in chunk]}).encode("utf-8")
+        req = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json"})
+        req.add_header("Authorization", f"Basic {b64_auth}")
+
+        try:
+            with urllib.request.urlopen(req) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8"))
+                errors = resp_data.get("errors", [])
+                if errors:
+                    print(f"[!] Neo4j Error at batch {i}-{i+len(chunk)}: {errors}")
+                    return False
+                executed += len(chunk)
+                print(f"[*] Progress: {executed}/{total} statements committed.")
+        except urllib.error.URLError as e:
+            print(f"[-] Could not connect to Neo4j HTTP API at {endpoint}: {e}")
+            return False
+
+    print(f"[+] Successfully executed all {total} graph statements in Neo4j.")
+    return True
 
 
 def main():
