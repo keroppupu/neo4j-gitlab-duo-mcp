@@ -1,0 +1,28 @@
+# GitLab CI/CD Pipeline for Neo4j Knowledge Graph Ingestion
+# Automatically scans C and COBOL code and updates Neo4j Knowledge Graph on push to main
+
+stages:
+  - analyze
+
+neo4j-knowledge-graph-sync:
+  stage: analyze
+  image: python:3.11-slim
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+        - "**/*.c"
+        - "**/*.h"
+        - "**/*.cbl"
+        - "**/*.cob"
+        - "**/*.cpy"
+  variables:
+    NEO4J_URL: "http://neo4j.internal:7474" # または Neo4j サーバーのアドレス
+    NEO4J_USER: "neo4j"
+    NEO4J_PASSWORD: $NEO4J_PASSWORD # GitLab CI/CD Settings -> Variables で設定
+  script:
+    - echo "Analyzing C and COBOL dependencies..."
+    - python analyzer/analyze_dependencies.py . --output-cypher graph.cql --neo4j-url "$NEO4J_URL" --user "$NEO4J_USER" --password "$NEO4J_PASSWORD" --sync
+  artifacts:
+    paths:
+      - graph.cql
+    expire_in: 1 week
