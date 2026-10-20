@@ -1,0 +1,23 @@
+#include <stdio.h>
+#include "db_utils.h"
+
+EXEC SQL INCLUDE sqlca;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    int emp_id;
+    char emp_name[50];
+EXEC SQL END DECLARE SECTION;
+
+void fetch_employee(int id) {
+    emp_id = id;
+
+    EXEC SQL SELECT ENAME INTO :emp_name
+             FROM EMP
+             WHERE EMPNO = :emp_id;
+
+    EXEC SQL UPDATE SALARY
+             SET AMOUNT = AMOUNT + 1000
+             WHERE EMPNO = :emp_id;
+
+    EXEC SQL COMMIT;
+}

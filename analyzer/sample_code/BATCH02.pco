@@ -1,0 +1,30 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. BATCH02.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+           EXEC SQL INCLUDE SQLCA END-EXEC.
+           COPY CUSTOMER.
+
+           EXEC SQL BEGIN DECLARE SECTION END-EXEC.
+           01 DB-CUST-ID   PIC X(10).
+           01 DB-CUST-BAL  PIC S9(9)V99.
+           EXEC SQL END DECLARE SECTION END-EXEC.
+
+       PROCEDURE DIVISION.
+       MAIN-LOGIC.
+           MOVE "CUST0001" TO DB-CUST-ID.
+           PERFORM FETCH-CUSTOMER-DATA.
+           STOP RUN.
+
+       FETCH-CUSTOMER-DATA.
+           EXEC SQL
+               SELECT BALANCE
+               INTO :DB-CUST-BAL
+               FROM ACCOUNTS
+               WHERE CUSTOMER_ID = :DB-CUST-ID
+           END-EXEC.
+
+           EXEC SQL
+               INSERT INTO AUDIT_LOG (LOG_MSG)
+               VALUES ('CUSTOMER FETCHED')
+           END-EXEC.

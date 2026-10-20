@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 """
-Full C & COBOL Repository Scanner and Dependency Analyzer for Neo4j.
+Enterprise C / COBOL / Pro*C / Pro*COBOL Dependency & Database Graph Analyzer for Neo4j.
 
-Features:
-- Discovers git repository root or takes an explicit directory.
-- Recursively scans all files respecting .gitignore and ignoring hidden/.git/build directories.
-- Handles C:
-    - #include <...> and #include "..." (local vs system headers)
-    - Macro definitions (#define)
-    - Function definitions & forward declarations
-    - Function call references
-- Handles COBOL:
-    - PROGRAM-ID
-    - COPY statements & copybook linking
-    - CALL statements (dynamic and static subprogram calls)
-    - SECTION / PARAGRAPH definitions
-    - PERFORM statements
-- Resolves cross-file dependencies (linking calls/includes to concrete defined entities in the repo).
-- Generates rich Cypher graph queries and directly syncs to Neo4j.
+Supported Technologies:
+- C / C++ (.c, .h, .cpp, .hpp)
+- Pro*C (.pc) - Embedded SQL (EXEC SQL SELECT / INSERT / UPDATE / DELETE / INCLUDE)
+- COBOL (.cbl, .cob, .cobol)
+- Pro*COBOL (.pco, .pbl) - Embedded SQL in COBOL
+- Copybook (.cpy) - Data Division structure & fields parser
+
+Graph Elements Produced:
+- (SourceFile)
+- (Function), (CobolProgram), (Section)
+- (HeaderFile), (Copybook), (CopybookField)
+- (DatabaseTable), (SqlOperation)
+- Relational Edges: INCLUDES, DEFINES, CALLS, COPIES, DEFINES_FIELD, ACCESSES_TABLE
 """
 
 import os
@@ -30,7 +27,64 @@ import urllib.error
 from pathlib import Path
 
 
-class AdvancedCParser:
+class SqlExtractor:
+    """Extracts Embedded SQL operations (SELECT, INSERT, UPDATE, DELETE, EXEC SQL INCLUDE) and Tables."""
+    
+    # Regex to capture EXEC SQL ... END-EXEC (COBOL/Pro*COBOL) or EXEC SQL ... ; (C/Pro*C)
+    EXEC_SQL_C_REGEX = re.compile(r'EXEC\s+SQL\s+(.*?);', re.IGNORECASE | re.DOTALL)
+    EXEC_SQL_COBOL_REGEX = re.compile(r'EXEC\s+SQL\s+(.*?)END-EXEC', re.IGNORECASE | re.DOTALL)
+
+    # SQL clauses
+    TABLE_FROM_REGEX = re.compile(r'\b(?:FROM|JOIN|UPDATE|INTO)\s+([a-zA-Z0-9_\$#]+)', re.IGNORECASE)
+    SQL_ACTION_REGEX = re.compile(r'^\s*(SELECT|INSERT|UPDATE|DELETE|INCLUDE|DECLARE|OPEN|FETCH|CLOSE|COMMIT|ROLLBACK)\b', re.IGNORECASE)
+
+    KEYWORDS = {'SET', 'VALUES', 'WHERE', 'AND', 'OR', 'SELECT', 'FROM', 'INTO', 'TABLE', 'INDEX', 'VIEW', 'BEGIN', 'END', 'SECTION', 'SQLCA'}
+
+    @classmethod
+    def extract_sql_from_c(cls, content: str):
+        operations = []
+        for match in cls.EXEC_SQL_C_REGEX.finditer(content):
+            sql_text = " ".join(match.group(1).split())
+            action_match = cls.SQL_ACTION_REGEX.search(sql_text)
+            action = action_match.group(1).upper() if action_match else "SQL"
+            
+            # Find referenced tables
+            tables = set()
+            for t_match in cls.TABLE_FROM_REGEX.finditer(sql_text):
+                tbl = t_match.group(1).upper()
+                if tbl not in cls.KEYWORDS:
+                    tables.add(tbl)
+
+            operations.append({
+                "action": action,
+                "tables": list(tables),
+                "raw_sql": sql_text[:120]
+            })
+        return operations
+
+    @classmethod
+    def extract_sql_from_cobol(cls, content: str):
+        operations = []
+        for match in cls.EXEC_SQL_COBOL_REGEX.finditer(content):
+            sql_text = " ".join(match.group(1).split())
+            action_match = cls.SQL_ACTION_REGEX.search(sql_text)
+            action = action_match.group(1).upper() if action_match else "SQL"
+
+            tables = set()
+            for t_match in cls.TABLE_FROM_REGEX.finditer(sql_text):
+                tbl = t_match.group(1).upper()
+                if tbl not in cls.KEYWORDS:
+                    tables.add(tbl)
+
+            operations.append({
+                "action": action,
+                "tables": list(tables),
+                "raw_sql": sql_text[:120]
+            })
+        return operations
+
+
+class CAndProCParser:
     INCLUDE_REGEX = re.compile(r'^[ \t]*#include\s*([<"])([^>"]+)([>"])', re.MULTILINE)
     MACRO_REGEX = re.compile(r'^[ \t]*#define\s+([a-zA-Z_][a-zA-Z0-9_]*)', re.MULTILINE)
     FUNC_DEF_REGEX = re.compile(
@@ -38,30 +92,26 @@ class AdvancedCParser:
         re.MULTILINE | re.DOTALL
     )
     FUNC_CALL_REGEX = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
-    KEYWORDS = {
-        'if', 'for', 'while', 'switch', 'return', 'sizeof', 'printf', 'fprintf', 'scanf',
-        'malloc', 'free', 'memset', 'memcpy', 'exit', 'main'
-    }
+    KEYWORDS = {'if', 'for', 'while', 'switch', 'return', 'sizeof', 'printf', 'fprintf', 'scanf'}
 
-    def parse(self, file_path: str, rel_path: str, content: str):
+    def parse(self, file_path: str, rel_path: str, content: str, is_proc: bool = False):
         file_name = os.path.basename(file_path)
         data = {
-            "type": "C",
+            "type": "Pro*C" if is_proc else "C",
             "file": file_name,
             "path": rel_path,
             "includes": [],
             "macros": [],
             "functions": [],
-            "calls": []
+            "calls": [],
+            "sql_operations": []
         }
 
-        # 1. Includes (distinguish local vs system)
+        # 1. Includes
         for m in self.INCLUDE_REGEX.finditer(content):
-            bracket_type = m.group(1)
-            inc_target = m.group(2)
             data["includes"].append({
-                "target": inc_target,
-                "is_system": bracket_type == '<'
+                "target": m.group(2),
+                "is_system": m.group(1) == '<'
             })
 
         # 2. Macros
@@ -75,8 +125,7 @@ class AdvancedCParser:
             if func_name in {'if', 'for', 'while', 'switch'}:
                 continue
             data["functions"].append(func_name)
-            
-            # Analyze function body
+
             start_pos = match.end()
             end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(content)
             body = content[start_pos:end_pos]
@@ -85,10 +134,53 @@ class AdvancedCParser:
                 if call not in {'if', 'for', 'while', 'switch'} and call != func_name:
                     data["calls"].append({"caller": func_name, "callee": call})
 
+        # 4. Embedded SQL (Pro*C)
+        if is_proc or "EXEC SQL" in content.upper():
+            data["sql_operations"] = SqlExtractor.extract_sql_from_c(content)
+
         return data
 
 
-class AdvancedCobolParser:
+class CopybookParser:
+    """Parses COBOL Copybooks (.cpy) and extracts record structures and field definitions."""
+    
+    FIELD_REGEX = re.compile(r'^[ \t]*(\d{2})\s+([a-zA-Z0-9_\-]+)(?:\s+PIC\s+([a-zA-Z0-9()vVsS]+))?', re.MULTILINE | re.IGNORECASE)
+
+    def parse(self, file_path: str, rel_path: str, content: str):
+        file_name = os.path.basename(file_path)
+        cb_name = os.path.splitext(file_name)[0].upper()
+        
+        data = {
+            "type": "COPYBOOK",
+            "file": file_name,
+            "path": rel_path,
+            "copybook_name": cb_name,
+            "fields": []
+        }
+
+        for line in content.splitlines():
+            # Skip comments
+            if re.match(r'^\d{6}', line):
+                line = line[6:]
+            if line.startswith('*') or line.startswith('/'):
+                continue
+            
+            m = self.FIELD_REGEX.search(line)
+            if m:
+                level = m.group(1)
+                name = m.group(2).upper()
+                pic = m.group(3) or ""
+                if name not in {'FILLER', 'END-EXEC'}:
+                    data["fields"].append({
+                        "level": level,
+                        "name": name,
+                        "pic": pic
+                    })
+
+        return data
+
+
+class CobolAndProCobolParser:
     PROGRAM_ID_REGEX = re.compile(r'PROGRAM-ID\.\s*([a-zA-Z0-9_\-]+)', re.IGNORECASE)
     COPY_REGEX = re.compile(r'\bCOPY\s+([a-zA-Z0-9_\-]+)', re.IGNORECASE)
     CALL_REGEX = re.compile(r'\bCALL\s+["\']([a-zA-Z0-9_\-]+)["\']', re.IGNORECASE)
@@ -96,29 +188,27 @@ class AdvancedCobolParser:
     SECTION_REGEX = re.compile(r'^[ \t]*([a-zA-Z0-9_\-]+)\s*(?:SECTION|PROCEDURE)?\.\s*$', re.MULTILINE | re.IGNORECASE)
     RESERVED = {'IDENTIFICATION', 'ENVIRONMENT', 'DATA', 'PROCEDURE', 'DIVISION', 'WORKING-STORAGE', 'STOP', 'RUN'}
 
-    def parse(self, file_path: str, rel_path: str, content: str):
+    def parse(self, file_path: str, rel_path: str, content: str, is_procobol: bool = False):
         file_name = os.path.basename(file_path)
         prog_match = self.PROGRAM_ID_REGEX.search(content)
         program_id = prog_match.group(1).upper() if prog_match else file_name.rsplit('.', 1)[0].upper()
 
         data = {
-            "type": "COBOL",
+            "type": "Pro*COBOL" if is_procobol else "COBOL",
             "file": file_name,
             "path": rel_path,
             "program_id": program_id,
             "copybooks": [],
             "calls": [],
             "sections": [],
-            "performs": []
+            "performs": [],
+            "sql_operations": []
         }
 
-        # Handle 72-column or standard formats
         cleaned_lines = []
         for line in content.splitlines():
-            # Drop line numbers in cols 1-6 if 6 leading digits
             if re.match(r'^\d{6}', line):
                 line = line[6:]
-            # Skip comment lines in column 7
             if line.startswith('*') or line.startswith('/'):
                 continue
             cleaned_lines.append(line)
@@ -137,21 +227,28 @@ class AdvancedCobolParser:
             if tgt not in self.RESERVED and tgt not in data["performs"]:
                 data["performs"].append(tgt)
 
+        # Embedded SQL (Pro*COBOL)
+        if is_procobol or "EXEC SQL" in content.upper():
+            data["sql_operations"] = SqlExtractor.extract_sql_from_cobol(content)
+
         return data
 
 
 def scan_repository(repo_root):
-    """Walks the entire repository, skips git/build dirs, and parses all C and COBOL files."""
-    c_parser = AdvancedCParser()
-    cobol_parser = AdvancedCobolParser()
+    c_parser = CAndProCParser()
+    cobol_parser = CobolAndProCobolParser()
+    copybook_parser = CopybookParser()
     results = []
 
     c_exts = {'.c', '.h', '.cpp', '.hpp', '.cc', '.cxx'}
-    cobol_exts = {'.cbl', '.cob', '.cpy', '.cobol'}
+    proc_exts = {'.pc', '.pcc'}
+    cobol_exts = {'.cbl', '.cob', '.cobol'}
+    procobol_exts = {'.pco', '.pbl'}
+    copybook_exts = {'.cpy'}
+
     ignore_dirs = {'.git', 'node_modules', 'dist', 'build', 'out', 'venv', '.venv'}
 
     for root, dirs, files in os.walk(repo_root):
-        # Exclude ignored dirs
         dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith('.')]
 
         for f in files:
@@ -166,20 +263,22 @@ def scan_repository(repo_root):
                 print(f"[-] Could not read {rel_path}: {e}")
                 continue
 
-            if ext in c_exts:
-                results.append(c_parser.parse(path, rel_path, content))
+            if ext in proc_exts or (ext in c_exts and "EXEC SQL" in content.upper()):
+                results.append(c_parser.parse(path, rel_path, content, is_proc=True))
+            elif ext in c_exts:
+                results.append(c_parser.parse(path, rel_path, content, is_proc=False))
+            elif ext in copybook_exts:
+                results.append(copybook_parser.parse(path, rel_path, content))
+            elif ext in procobol_exts or (ext in cobol_exts and "EXEC SQL" in content.upper()):
+                results.append(cobol_parser.parse(path, rel_path, content, is_procobol=True))
             elif ext in cobol_exts:
-                results.append(cobol_parser.parse(path, rel_path, content))
+                results.append(cobol_parser.parse(path, rel_path, content, is_procobol=False))
 
     return results
 
 
 def build_graph_statements(results):
     statements = []
-    
-    # Store indices for cross-file linking
-    defined_functions = {}  # func_name -> file_path
-    defined_cobol_programs = {}  # program_id -> file_path
 
     for item in results:
         f_name = item["file"]
@@ -192,26 +291,38 @@ def build_graph_statements(results):
         SET f.name = '{f_name}', f.type = '{f_type}'
         """)
 
-        if f_type == "C":
+        # 1. Copybook specific nodes & fields
+        if f_type == "COPYBOOK":
+            cb_name = item["copybook_name"]
+            statements.append(f"""
+            MERGE (f:SourceFile {{path: '{f_path}'}})
+            MERGE (cb:Copybook {{name: '{cb_name}'}})
+            SET cb.file = '{f_path}'
+            MERGE (f)-[:CONTAINS]->(cb)
+            """)
+
+            for field in item["fields"]:
+                f_level = field["level"]
+                fld_name = field["name"]
+                f_pic = field["pic"]
+                statements.append(f"""
+                MERGE (cb:Copybook {{name: '{cb_name}'}})
+                MERGE (cf:CopybookField {{name: '{fld_name}', copybook: '{cb_name}'}})
+                SET cf.level = '{f_level}', cf.pic = '{f_pic}'
+                MERGE (cb)-[:DEFINES_FIELD]->(cf)
+                """)
+
+        # 2. C / Pro*C
+        elif f_type in ("C", "Pro*C"):
             for inc in item["includes"]:
-                inc_target = inc["target"]
-                is_sys = inc["is_system"]
                 statements.append(f"""
                 MERGE (f:SourceFile {{path: '{f_path}'}})
-                MERGE (inc:HeaderFile {{name: '{inc_target}'}})
-                SET inc.is_system = {str(is_sys).lower()}
+                MERGE (inc:HeaderFile {{name: '{inc["target"]}'}})
+                SET inc.is_system = {str(inc["is_system"]).lower()}
                 MERGE (f)-[:INCLUDES]->(inc)
                 """)
 
-            for macro in item["macros"]:
-                statements.append(f"""
-                MERGE (f:SourceFile {{path: '{f_path}'}})
-                MERGE (m:Macro {{name: '{macro}'}})
-                MERGE (f)-[:DEFINES_MACRO]->(m)
-                """)
-
             for fn in item["functions"]:
-                defined_functions[fn] = f_path
                 statements.append(f"""
                 MERGE (f:SourceFile {{path: '{f_path}'}})
                 MERGE (fn:Function {{name: '{fn}', file: '{f_path}'}})
@@ -219,35 +330,44 @@ def build_graph_statements(results):
                 """)
 
             for call in item["calls"]:
-                caller = call["caller"]
-                callee = call["callee"]
                 statements.append(f"""
-                MERGE (caller:Function {{name: '{caller}', file: '{f_path}'}})
-                MERGE (callee:Function {{name: '{callee}'}})
+                MERGE (caller:Function {{name: '{call["caller"]}', file: '{f_path}'}})
+                MERGE (callee:Function {{name: '{call["callee"]}'}})
                 MERGE (caller)-[:CALLS]->(callee)
                 """)
 
-        elif f_type == "COBOL":
+            # Embedded SQL operations & Tables
+            for sql in item.get("sql_operations", []):
+                action = sql["action"]
+                for tbl in sql["tables"]:
+                    statements.append(f"""
+                    MERGE (f:SourceFile {{path: '{f_path}'}})
+                    MERGE (t:DatabaseTable {{name: '{tbl}'}})
+                    MERGE (f)-[:ACCESSES_TABLE {{action: '{action}'}}]->(t)
+                    """)
+
+        # 3. COBOL / Pro*COBOL
+        elif f_type in ("COBOL", "Pro*COBOL"):
             prog = item["program_id"]
-            defined_cobol_programs[prog] = f_path
             statements.append(f"""
             MERGE (f:SourceFile {{path: '{f_path}'}})
             MERGE (p:CobolProgram {{name: '{prog}'}})
-            SET p.file = '{f_path}'
+            SET p.file = '{f_path}', p.is_procobol = {str(f_type == "Pro*COBOL").lower()}
             MERGE (f)-[:CONTAINS]->(p)
             """)
 
+            # Links to Copybook
             for cpy in item["copybooks"]:
                 statements.append(f"""
                 MERGE (p:CobolProgram {{name: '{prog}'}})
-                MERGE (cb:Copybook {{name: '{cpy}'}})
+                MERGE (cb:Copybook {{name: '{cpy.upper()}'}})
                 MERGE (p)-[:COPIES]->(cb)
                 """)
 
             for ext_call in item["calls"]:
                 statements.append(f"""
                 MERGE (p:CobolProgram {{name: '{prog}'}})
-                MERGE (sub:CobolProgram {{name: '{ext_call}'}})
+                MERGE (sub:CobolProgram {{name: '{ext_call.upper()}'}})
                 MERGE (p)-[:CALLS]->(sub)
                 """)
 
@@ -264,6 +384,16 @@ def build_graph_statements(results):
                 MERGE (s:Section {{name: '{perf}', program: '{prog}'}})
                 MERGE (p)-[:PERFORMS]->(s)
                 """)
+
+            # Embedded SQL operations & Tables
+            for sql in item.get("sql_operations", []):
+                action = sql["action"]
+                for tbl in sql["tables"]:
+                    statements.append(f"""
+                    MERGE (p:CobolProgram {{name: '{prog}'}})
+                    MERGE (t:DatabaseTable {{name: '{tbl}'}})
+                    MERGE (p)-[:ACCESSES_TABLE {{action: '{action}'}}]->(t)
+                    """)
 
     return statements
 
@@ -298,7 +428,7 @@ def execute_cypher_via_http(statements, neo4j_url="http://localhost:7474", auth=
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Full Repository Inspection for C & COBOL dependencies into Neo4j")
+    parser = argparse.ArgumentParser(description="Full Enterprise C/COBOL/Pro*C/Pro*COBOL/Copybook Analyzer for Neo4j")
     parser.add_argument("repo_path", nargs="?", default=".", help="Root path of repository to inspect (default: current directory)")
     parser.add_argument("--output-cypher", help="File to write Cypher statements (.cql)")
     parser.add_argument("--neo4j-url", default="http://localhost:7474", help="Neo4j HTTP base URL (default: http://localhost:7474)")
@@ -310,17 +440,21 @@ def main():
     repo_root = os.path.abspath(args.repo_path)
 
     print(f"============================================================")
-    print(f"[*] Starting Full Repository Inspection")
+    print(f"[*] Enterprise Repository Inspection: C / COBOL / Pro*C / Pro*COBOL / Copybook")
     print(f"[*] Target Directory: {repo_root}")
     print(f"============================================================")
 
     results = scan_repository(repo_root)
-    c_count = sum(1 for r in results if r["type"] == "C")
-    cobol_count = sum(1 for r in results if r["type"] == "COBOL")
-
-    print(f"[+] Found {len(results)} relevant source files (C: {c_count}, COBOL: {cobol_count})")
+    types_count = {}
     for r in results:
-        print(f"    - [{r['type']}] {r['path']}")
+        t = r["type"]
+        types_count[t] = types_count.get(t, 0) + 1
+
+    print(f"[+] Found {len(results)} source artifacts:")
+    for t, cnt in types_count.items():
+        print(f"    - {t}: {cnt}")
+    for r in results:
+        print(f"    * [{r['type']:<10}] {r['path']}")
 
     statements = build_graph_statements(results)
     print(f"[+] Generated {len(statements)} graph relationship statements.")
@@ -332,10 +466,10 @@ def main():
         print(f"[+] Saved Cypher queries to: {args.output_cypher}")
 
     if args.sync:
-        print(f"[*] Syncing full repository graph to Neo4j ({args.neo4j_url})...")
+        print(f"[*] Syncing full enterprise graph to Neo4j ({args.neo4j_url})...")
         execute_cypher_via_http(statements, neo4j_url=args.neo4j_url, auth=(args.user, args.password))
 
-    print(f"[+] Full repository inspection completed.")
+    print(f"[+] Full enterprise repository inspection completed.")
 
 
 if __name__ == "__main__":
