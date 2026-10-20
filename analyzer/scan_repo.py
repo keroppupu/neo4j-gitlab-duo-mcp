@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
-Enterprise C / COBOL / Pro*C / Pro*COBOL Dependency & Database Graph Analyzer for Neo4j.
+Enterprise Multi-Project C / COBOL / Pro*C / Pro*COBOL Dependency & Database Graph Analyzer for Neo4j.
 
-Supported Technologies:
+Supports:
+- Multi-project isolation & cross-project relationships via (:Project) nodes and project property tagging.
 - C / C++ (.c, .h, .cpp, .hpp)
-- Pro*C (.pc) - Embedded SQL (EXEC SQL SELECT / INSERT / UPDATE / DELETE / INCLUDE)
+- Pro*C (.pc, .pcc) - Embedded SQL
 - COBOL (.cbl, .cob, .cobol)
 - Pro*COBOL (.pco, .pbl) - Embedded SQL in COBOL
 - Copybook (.cpy) - Data Division structure & fields parser
-
-Graph Elements Produced:
-- (SourceFile)
-- (Function), (CobolProgram), (Section)
-- (HeaderFile), (Copybook), (CopybookField)
-- (DatabaseTable), (SqlOperation)
-- Relational Edges: INCLUDES, DEFINES, CALLS, COPIES, DEFINES_FIELD, ACCESSES_TABLE
+- LAN server sync via --neo4j-url http://<SERVER_IP>:7474 --sync
 """
 
 import os
@@ -28,13 +23,9 @@ from pathlib import Path
 
 
 class SqlExtractor:
-    """Extracts Embedded SQL operations (SELECT, INSERT, UPDATE, DELETE, EXEC SQL INCLUDE) and Tables."""
-    
-    # Regex to capture EXEC SQL ... END-EXEC (COBOL/Pro*COBOL) or EXEC SQL ... ; (C/Pro*C)
     EXEC_SQL_C_REGEX = re.compile(r'EXEC\s+SQL\s+(.*?);', re.IGNORECASE | re.DOTALL)
     EXEC_SQL_COBOL_REGEX = re.compile(r'EXEC\s+SQL\s+(.*?)END-EXEC', re.IGNORECASE | re.DOTALL)
 
-    # SQL clauses
     TABLE_FROM_REGEX = re.compile(r'\b(?:FROM|JOIN|UPDATE|INTO)\s+([a-zA-Z0-9_\$#]+)', re.IGNORECASE)
     SQL_ACTION_REGEX = re.compile(r'^\s*(SELECT|INSERT|UPDATE|DELETE|INCLUDE|DECLARE|OPEN|FETCH|CLOSE|COMMIT|ROLLBACK)\b', re.IGNORECASE)
 
@@ -48,7 +39,6 @@ class SqlExtractor:
             action_match = cls.SQL_ACTION_REGEX.search(sql_text)
             action = action_match.group(1).upper() if action_match else "SQL"
             
-            # Find referenced tables
             tables = set()
             for t_match in cls.TABLE_FROM_REGEX.finditer(sql_text):
                 tbl = t_match.group(1).upper()
@@ -92,7 +82,6 @@ class CAndProCParser:
         re.MULTILINE | re.DOTALL
     )
     FUNC_CALL_REGEX = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
-    KEYWORDS = {'if', 'for', 'while', 'switch', 'return', 'sizeof', 'printf', 'fprintf', 'scanf'}
 
     def parse(self, file_path: str, rel_path: str, content: str, is_proc: bool = False):
         file_name = os.path.basename(file_path)
@@ -107,18 +96,15 @@ class CAndProCParser:
             "sql_operations": []
         }
 
-        # 1. Includes
         for m in self.INCLUDE_REGEX.finditer(content):
             data["includes"].append({
                 "target": m.group(2),
                 "is_system": m.group(1) == '<'
             })
 
-        # 2. Macros
         for m in self.MACRO_REGEX.finditer(content):
             data["macros"].append(m.group(1))
 
-        # 3. Functions & calls
         matches = list(self.FUNC_DEF_REGEX.finditer(content))
         for i, match in enumerate(matches):
             func_name = match.group(1)
@@ -134,7 +120,6 @@ class CAndProCParser:
                 if call not in {'if', 'for', 'while', 'switch'} and call != func_name:
                     data["calls"].append({"caller": func_name, "callee": call})
 
-        # 4. Embedded SQL (Pro*C)
         if is_proc or "EXEC SQL" in content.upper():
             data["sql_operations"] = SqlExtractor.extract_sql_from_c(content)
 
@@ -142,8 +127,6 @@ class CAndProCParser:
 
 
 class CopybookParser:
-    """Parses COBOL Copybooks (.cpy) and extracts record structures and field definitions."""
-    
     FIELD_REGEX = re.compile(r'^[ \t]*(\d{2})\s+([a-zA-Z0-9_\-]+)(?:\s+PIC\s+([a-zA-Z0-9()vVsS]+))?', re.MULTILINE | re.IGNORECASE)
 
     def parse(self, file_path: str, rel_path: str, content: str):
@@ -159,7 +142,6 @@ class CopybookParser:
         }
 
         for line in content.splitlines():
-            # Skip comments
             if re.match(r'^\d{6}', line):
                 line = line[6:]
             if line.startswith('*') or line.startswith('/'):
@@ -227,7 +209,6 @@ class CobolAndProCobolParser:
             if tgt not in self.RESERVED and tgt not in data["performs"]:
                 data["performs"].append(tgt)
 
-        # Embedded SQL (Pro*COBOL)
         if is_procobol or "EXEC SQL" in content.upper():
             data["sql_operations"] = SqlExtractor.extract_sql_from_cobol(content)
 
@@ -277,26 +258,38 @@ def scan_repository(repo_root):
     return results
 
 
-def build_graph_statements(results):
+def build_graph_statements(results, project_name="default"):
+    """
+    Builds graph statements with multi-project scoping.
+    Every artifact connects to a (:Project {name: $project_name}) node and has project property.
+    Database tables can be shared across projects to detect cross-project data dependencies.
+    """
     statements = []
+
+    # Project Node
+    statements.append(f"""
+    MERGE (proj:Project {{name: '{project_name}'}})
+    """)
 
     for item in results:
         f_name = item["file"]
         f_path = item["path"]
         f_type = item["type"]
 
-        # Base File Node
+        # Base File Node linked to Project
         statements.append(f"""
-        MERGE (f:SourceFile {{path: '{f_path}'}})
+        MERGE (proj:Project {{name: '{project_name}'}})
+        MERGE (f:SourceFile {{path: '{f_path}', project: '{project_name}'}})
         SET f.name = '{f_name}', f.type = '{f_type}'
+        MERGE (proj)-[:CONTAINS_FILE]->(f)
         """)
 
-        # 1. Copybook specific nodes & fields
+        # 1. Copybook
         if f_type == "COPYBOOK":
             cb_name = item["copybook_name"]
             statements.append(f"""
-            MERGE (f:SourceFile {{path: '{f_path}'}})
-            MERGE (cb:Copybook {{name: '{cb_name}'}})
+            MERGE (f:SourceFile {{path: '{f_path}', project: '{project_name}'}})
+            MERGE (cb:Copybook {{name: '{cb_name}', project: '{project_name}'}})
             SET cb.file = '{f_path}'
             MERGE (f)-[:CONTAINS]->(cb)
             """)
@@ -306,8 +299,8 @@ def build_graph_statements(results):
                 fld_name = field["name"]
                 f_pic = field["pic"]
                 statements.append(f"""
-                MERGE (cb:Copybook {{name: '{cb_name}'}})
-                MERGE (cf:CopybookField {{name: '{fld_name}', copybook: '{cb_name}'}})
+                MERGE (cb:Copybook {{name: '{cb_name}', project: '{project_name}'}})
+                MERGE (cf:CopybookField {{name: '{fld_name}', copybook: '{cb_name}', project: '{project_name}'}})
                 SET cf.level = '{f_level}', cf.pic = '{f_pic}'
                 MERGE (cb)-[:DEFINES_FIELD]->(cf)
                 """)
@@ -316,83 +309,81 @@ def build_graph_statements(results):
         elif f_type in ("C", "Pro*C"):
             for inc in item["includes"]:
                 statements.append(f"""
-                MERGE (f:SourceFile {{path: '{f_path}'}})
-                MERGE (inc:HeaderFile {{name: '{inc["target"]}'}})
+                MERGE (f:SourceFile {{path: '{f_path}', project: '{project_name}'}})
+                MERGE (inc:HeaderFile {{name: '{inc["target"]}', project: '{project_name}'}})
                 SET inc.is_system = {str(inc["is_system"]).lower()}
                 MERGE (f)-[:INCLUDES]->(inc)
                 """)
 
             for fn in item["functions"]:
                 statements.append(f"""
-                MERGE (f:SourceFile {{path: '{f_path}'}})
-                MERGE (fn:Function {{name: '{fn}', file: '{f_path}'}})
+                MERGE (f:SourceFile {{path: '{f_path}', project: '{project_name}'}})
+                MERGE (fn:Function {{name: '{fn}', project: '{project_name}', file: '{f_path}'}})
                 MERGE (f)-[:DEFINES]->(fn)
                 """)
 
             for call in item["calls"]:
                 statements.append(f"""
-                MERGE (caller:Function {{name: '{call["caller"]}', file: '{f_path}'}})
-                MERGE (callee:Function {{name: '{call["callee"]}'}})
+                MERGE (caller:Function {{name: '{call["caller"]}', project: '{project_name}', file: '{f_path}'}})
+                MERGE (callee:Function {{name: '{call["callee"]}', project: '{project_name}'}})
                 MERGE (caller)-[:CALLS]->(callee)
                 """)
 
-            # Embedded SQL operations & Tables
+            # Database Table access (DatabaseTable node is globally identified by name across projects)
             for sql in item.get("sql_operations", []):
                 action = sql["action"]
                 for tbl in sql["tables"]:
                     statements.append(f"""
-                    MERGE (f:SourceFile {{path: '{f_path}'}})
+                    MERGE (f:SourceFile {{path: '{f_path}', project: '{project_name}'}})
                     MERGE (t:DatabaseTable {{name: '{tbl}'}})
-                    MERGE (f)-[:ACCESSES_TABLE {{action: '{action}'}}]->(t)
+                    MERGE (f)-[:ACCESSES_TABLE {{action: '{action}', project: '{project_name}'}}]->(t)
                     """)
 
         # 3. COBOL / Pro*COBOL
         elif f_type in ("COBOL", "Pro*COBOL"):
             prog = item["program_id"]
             statements.append(f"""
-            MERGE (f:SourceFile {{path: '{f_path}'}})
-            MERGE (p:CobolProgram {{name: '{prog}'}})
+            MERGE (f:SourceFile {{path: '{f_path}', project: '{project_name}'}})
+            MERGE (p:CobolProgram {{name: '{prog}', project: '{project_name}'}})
             SET p.file = '{f_path}', p.is_procobol = {str(f_type == "Pro*COBOL").lower()}
             MERGE (f)-[:CONTAINS]->(p)
             """)
 
-            # Links to Copybook
             for cpy in item["copybooks"]:
                 statements.append(f"""
-                MERGE (p:CobolProgram {{name: '{prog}'}})
-                MERGE (cb:Copybook {{name: '{cpy.upper()}'}})
+                MERGE (p:CobolProgram {{name: '{prog}', project: '{project_name}'}})
+                MERGE (cb:Copybook {{name: '{cpy.upper()}', project: '{project_name}'}})
                 MERGE (p)-[:COPIES]->(cb)
                 """)
 
             for ext_call in item["calls"]:
                 statements.append(f"""
-                MERGE (p:CobolProgram {{name: '{prog}'}})
-                MERGE (sub:CobolProgram {{name: '{ext_call.upper()}'}})
+                MERGE (p:CobolProgram {{name: '{prog}', project: '{project_name}'}})
+                MERGE (sub:CobolProgram {{name: '{ext_call.upper()}', project: '{project_name}'}})
                 MERGE (p)-[:CALLS]->(sub)
                 """)
 
             for sec in item["sections"]:
                 statements.append(f"""
-                MERGE (p:CobolProgram {{name: '{prog}'}})
-                MERGE (s:Section {{name: '{sec}', program: '{prog}'}})
+                MERGE (p:CobolProgram {{name: '{prog}', project: '{project_name}'}})
+                MERGE (s:Section {{name: '{sec}', program: '{prog}', project: '{project_name}'}})
                 MERGE (p)-[:DEFINES_SECTION]->(s)
                 """)
 
             for perf in item["performs"]:
                 statements.append(f"""
-                MERGE (p:CobolProgram {{name: '{prog}'}})
-                MERGE (s:Section {{name: '{perf}', program: '{prog}'}})
+                MERGE (p:CobolProgram {{name: '{prog}', project: '{project_name}'}})
+                MERGE (s:Section {{name: '{perf}', program: '{prog}', project: '{project_name}'}})
                 MERGE (p)-[:PERFORMS]->(s)
                 """)
 
-            # Embedded SQL operations & Tables
             for sql in item.get("sql_operations", []):
                 action = sql["action"]
                 for tbl in sql["tables"]:
                     statements.append(f"""
-                    MERGE (p:CobolProgram {{name: '{prog}'}})
+                    MERGE (p:CobolProgram {{name: '{prog}', project: '{project_name}'}})
                     MERGE (t:DatabaseTable {{name: '{tbl}'}})
-                    MERGE (p)-[:ACCESSES_TABLE {{action: '{action}'}}]->(t)
+                    MERGE (p)-[:ACCESSES_TABLE {{action: '{action}', project: '{project_name}'}}]->(t)
                     """)
 
     return statements
@@ -428,8 +419,9 @@ def execute_cypher_via_http(statements, neo4j_url="http://localhost:7474", auth=
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Full Enterprise C/COBOL/Pro*C/Pro*COBOL/Copybook Analyzer for Neo4j")
+    parser = argparse.ArgumentParser(description="Multi-Project Enterprise C/COBOL/Pro*C/Pro*COBOL/Copybook Analyzer")
     parser.add_argument("repo_path", nargs="?", default=".", help="Root path of repository to inspect (default: current directory)")
+    parser.add_argument("--project", help="Project name (defaults to repository folder name)")
     parser.add_argument("--output-cypher", help="File to write Cypher statements (.cql)")
     parser.add_argument("--neo4j-url", default="http://localhost:7474", help="Neo4j HTTP base URL (default: http://localhost:7474)")
     parser.add_argument("--user", default="neo4j", help="Neo4j user")
@@ -438,10 +430,12 @@ def main():
 
     args = parser.parse_args()
     repo_root = os.path.abspath(args.repo_path)
+    project_name = args.project or os.path.basename(repo_root)
 
     print(f"============================================================")
-    print(f"[*] Enterprise Repository Inspection: C / COBOL / Pro*C / Pro*COBOL / Copybook")
+    print(f"[*] Enterprise Multi-Project Scanner")
     print(f"[*] Target Directory: {repo_root}")
+    print(f"[*] Project Name    : {project_name}")
     print(f"============================================================")
 
     results = scan_repository(repo_root)
@@ -453,11 +447,9 @@ def main():
     print(f"[+] Found {len(results)} source artifacts:")
     for t, cnt in types_count.items():
         print(f"    - {t}: {cnt}")
-    for r in results:
-        print(f"    * [{r['type']:<10}] {r['path']}")
 
-    statements = build_graph_statements(results)
-    print(f"[+] Generated {len(statements)} graph relationship statements.")
+    statements = build_graph_statements(results, project_name=project_name)
+    print(f"[+] Generated {len(statements)} graph relationship statements (scoped to project '{project_name}').")
 
     if args.output_cypher:
         with open(args.output_cypher, "w", encoding="utf-8") as fp:
@@ -466,10 +458,10 @@ def main():
         print(f"[+] Saved Cypher queries to: {args.output_cypher}")
 
     if args.sync:
-        print(f"[*] Syncing full enterprise graph to Neo4j ({args.neo4j_url})...")
+        print(f"[*] Syncing to Neo4j ({args.neo4j_url})...")
         execute_cypher_via_http(statements, neo4j_url=args.neo4j_url, auth=(args.user, args.password))
 
-    print(f"[+] Full enterprise repository inspection completed.")
+    print(f"[+] Multi-project inspection completed.")
 
 
 if __name__ == "__main__":
