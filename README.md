@@ -18,7 +18,7 @@ Docker を利用してローカルまたは LAN サーバ上に **Neo4j ナレ�
   │
   └── GitLab Duo / Claude / Cursor (MCP Client)
         │
-        │ HTTP (7474) : グラフデータ登録 (バッチ同期)
+        │ HTTP (7474) : グラフデータ登録 (バッチ分割同期)
         │ Bolt (7687) : MCP経由での自然言語クエリ参照
         ▼
 [ サーバPC (LAN上の常時稼働ホスト) ]
@@ -71,52 +71,103 @@ Docker を利用してローカルまたは LAN サーバ上に **Neo4j ナレ�
 
 ---
 
-## 4. クイックスタートガイド
+## 4. ローカルスキャンの詳細手順ガイド（重要）
 
-### ステップ 1: サーバPCで Neo4j コンテナを起動する
+`analyzer/scan_repo.py` は、クライアント PC 上に `git pull` してきたローカルリポジトリを再帰的に走査し、構文・依存関係を解析して Neo4j サーバへ登録するためのツールです。
 
-サーバとなる PC（またはローカルマシン）で本リポジトリを展開し、コンテナを起動します。
-
-```bash
-cd neo4j-gitlab-duo-mcp
-docker compose up -d
-```
-
-- **Neo4j Web UI**: `http://localhost:7474` （LAN上の別PCからは `http://<サーバIP>:7474`）
-- **Bolt 通信ポート**: `7687`
-- **初期ユーザー**: `neo4j`
-- **初期パスワード**: `password123`
+### 4.1 前提環境・動作要件
+- **クライアント PC**: Python 3.7 以上がインストールされていること。
+  - **外部ライブラリのインストール（pip）は一切不要です**（Python 標準ライブラリ `urllib`, `re`, `json`, `argparse` のみで動作します）。
+  - クライアント PC 側に Docker や Neo4j は不要です。
+- **ネットワーク接続**: クライアント PC から Neo4j サーバの IP（例: `http://192.168.1.100:7474`）へ HTTP 通信ができること。
 
 ---
 
-### ステップ 2: ローカルリポジトリを全精査して登録する
+### 4.2 コマンドライン引数リファレンス
 
-解析対象のソースコードが存在する PC（LAN上の別PC、またはサーバ自身）からスキャナーを実行します。
-
-#### パターン A: 実行中の Neo4j サーバへ直接同期する（推奨）
 ```bash
-# ローカルで実行する場合
-python3 analyzer/scan_repo.py /path/to/target-repo --project "my-project" --sync
+python3 analyzer/scan_repo.py [対象ディレクトリパス] [オプション...]
+```
 
-# LAN上の別PCからサーバ（例: 192.168.1.100）へ同期する場合
-python3 analyzer/scan_repo.py /path/to/target-repo \
+| 引数・オプション | デフォルト値 | 説明 |
+| :--- | :--- | :--- |
+| `repo_path` | `.` (カレントディレクトリ) | スキャン対象のローカルリポジトリまたはソースコードのルートパス。 |
+| `--project` | ディレクトリ名 | プロジェクト識別名。Neo4j 内で `(:Project {name: "..."})` として紐づけられます。 |
+| `--neo4j-url` | `http://localhost:7474` | 接続先 Neo4j サーバの HTTP URL。LAN 上のサーバの場合は `http://<サーバIP>:7474` を指定。 |
+| `--user` | `neo4j` | Neo4j の認証ユーザー名。 |
+| `--password` | `password123` | Neo4j の認証パスワード。 |
+| `--sync` | なし（フラグ） | **指定すると、解析結果を即座に Neo4j サーバへバッチコミット登録します。** |
+| `--output-cypher` | なし | 生成された Cypher クエリ文をファイル（`.cql`）としてローカル保存する場合にファイルパスを指定。 |
+
+---
+
+### 4.3 スキャン実行シナリオ別コマンド例
+
+#### シナリオ 1: 開発PCから LAN 上の Neo4j サーバへ直接同期する（標準的な運用）
+クライアント PC に `git pull` してきたリポジトリを、プロジェクト名を明示してサーバへ一括登録します。
+
+```bash
+python3 analyzer/scan_repo.py /Users/developer/projects/core-banking \
     --project "core-banking" \
     --neo4j-url http://192.168.1.100:7474 \
     --user neo4j \
     --password password123 \
     --sync
 ```
+**実行出力例:**
+```text
+============================================================
+[*] Enterprise Multi-Project Scanner
+[*] Target Directory: /Users/developer/projects/core-banking
+[*] Project Name    : core-banking
+============================================================
+[+] Found 142 source artifacts:
+    - COBOL: 90
+    - COPYBOOK: 35
+    - Pro*COBOL: 17
+[+] Generated 1,280 graph relationship statements (scoped to project 'core-banking').
+[*] Syncing to Neo4j (http://192.168.1.100:7474)...
+[*] Progress: 50/1280 statements committed.
+[*] Progress: 100/1280 statements committed.
+...
+[+] Successfully executed all 1280 graph statements in Neo4j.
+[+] Multi-project inspection completed.
+```
 
-#### パターン B: Cypher クエリファイル (.cql) として出力して確認する場合
+#### シナリオ 2: サーバに登録する前に生成クエリを確認・保存したい場合
+`--sync` を付けずに `--output-cypher` を指定することで、ローカルに `.cql` ファイルを出力して中身を確認できます。
+
 ```bash
-python3 analyzer/scan_repo.py /path/to/target-repo \
-    --project "core-banking" \
-    --output-cypher graph.cql
+python3 analyzer/scan_repo.py /path/to/my-repo \
+    --project "billing-system" \
+    --output-cypher billing_graph.cql
+```
+
+#### シナリオ 3: 同一マシン上で Docker とスキャナーを動かす場合
+`--neo4j-url` の指定を省略（デフォルト `localhost:7474`）して実行できます。
+
+```bash
+python3 analyzer/scan_repo.py ./analyzer/sample_code --project "demo" --sync
 ```
 
 ---
 
-### ステップ 3: GitLab Duo / MCP クライアントを設定する
+### 4.4 スキャン処理の詳細な仕組み・挙動
+1. **ディレクトリの自動探索と除外処理**:
+   - 指定されたディレクトリ配下を再帰的に走査します。
+   - `.git`, `node_modules`, `dist`, `build`, `out`, `venv`, `.venv` などの管理・ビルド生成ディレクトリは**自動でスキップ**され、不要なファイルを読み込みません。
+2. **言語別の厳密なパース処理**:
+   - **C / Pro\*C**: コメント行（`/* ... */`, `// ...`）を安全に除去し、文字列内のクォートやエスケープ文字を正しく扱って誤検知を防ぎます。
+   - **COBOL / Pro\*COBOL**: 6桁の行番号や7カラム目のコメントマーク（`*`, `/`）を自動トリミングしてプログラムID、CALL文、PERFORM文を抽出します。
+   - **Copybook (`.cpy`)**: フィールドのレベル番号（01, 05等）および `PIC` 句をすべて抽出し、階層関係を保持します。
+   - **SQL 文抽出**: `EXEC SQL ... ;` または `EXEC SQL ... END-EXEC` をキャッチし、テーブル名と操作種別（SELECT, INSERT, UPDATE, DELETE等）を特定します。
+3. **バッチ分割コミットによる安定同期**:
+   - 抽出された数千〜数万件のノード・エッジ登録ステートメントは、50件ごとのチャンクに分割されて Neo4j のトランザクション API（HTTP POST）へ送信されます。
+   - これにより、大規模リポジトリを登録する際でもネットワークタイムアウトやサーバ側のメモリ枯渇を起こさずに安全に同期されます。
+
+---
+
+## 5. GitLab Duo / MCP クライアントの設定手順
 
 GitLab Duo や Claude Desktop、Cursor などの設定ファイル（例: `claude_desktop_config.json` 等）に、以下の MCP サーバー設定を登録します。
 
@@ -141,7 +192,7 @@ GitLab Duo や Claude Desktop、Cursor などの設定ファイル（例: `claud
 
 ---
 
-## 5. AI アシスタントへの問い合わせ（プロンプト）例
+## 6. AI アシスタントへの問い合わせ（プロンプト）例
 
 MCP 接続後、GitLab Duo やチャット画面から以下のような質問を行うことで、ナレッジグラフを活用した高精度な回答が得られます：
 
@@ -156,7 +207,7 @@ MCP 接続後、GitLab Duo やチャット画面から以下のような質問�
 
 ---
 
-## 6. 保守・セキュリティについて
+## 7. 保守・セキュリティについて
 
 - **パスワード変更**:
   - 本番運用時は `docker-compose.yml` 内の `NEO4J_AUTH` および各設定ファイルのパスワードを安全な任意の値に変更してください。
