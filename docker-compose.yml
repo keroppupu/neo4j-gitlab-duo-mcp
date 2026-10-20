@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  neo4j:
+    image: neo4j:5.20
+    container_name: neo4j-kg
+    restart: always
+    ports:
+      - "7474:7474" # HTTP Web UI
+      - "7687:7687" # Bolt protocol
+    environment:
+      - NEO4J_AUTH=neo4j/password123
+      - NEO4J_PLUGINS=["apoc"]
+    volumes:
+      - ./data:/data
+      - ./logs:/logs
+      - ./import:/var/lib/neo4j/import
+      - ./plugins:/plugins
+    networks:
+      - kg-network
+
+networks:
+  kg-network:
+    driver: bridge
